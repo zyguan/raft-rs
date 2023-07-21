@@ -16,6 +16,7 @@
 
 use std::cmp;
 use std::ops::{Deref, DerefMut};
+use std::time::SystemTime;
 
 use crate::eraftpb::{
     ConfChange, ConfChangeV2, ConfState, Entry, EntryType, HardState, Message, MessageType,
@@ -41,6 +42,13 @@ use crate::quorum::VoteResult;
 use crate::util;
 use crate::util::NO_LIMIT;
 use crate::{confchange, Progress, ProgressState, ProgressTracker};
+
+fn current_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
 
 // CAMPAIGN_PRE_ELECTION represents the first phase of a normal election when
 // Config.pre_vote is true.
@@ -271,6 +279,20 @@ pub struct Raft<T: Storage> {
     pub msgs: Vec<Message>,
     /// Internal raftCore.
     pub r: RaftCore<T>,
+
+    tick_times: [u64; 20],
+    tick_times_idx: usize,
+
+    follower_last_reset_election_elapsed_type: Option<MessageType>,
+    follower_last_reset_election_elapsed_time: u64,
+    leader_last_tick_time: u64,
+    leader_last_bcast_heartbeat_time: u64,
+    leader_last_bcast_append_time: u64,
+
+    /// The last time when the Raft state machine ticked.
+    pub fsm_last_tick_time: u64,
+    /// The number of ticks that the Raft state machine has missed.
+    pub fsm_missing_ticks: usize,
 }
 
 impl<T: Storage> Deref for Raft<T> {
@@ -361,6 +383,15 @@ impl<T: Storage> Raft<T> {
                 },
                 max_committed_size_per_ready: c.max_committed_size_per_ready,
             },
+            tick_times: [0; 20],
+            tick_times_idx: 0,
+            follower_last_reset_election_elapsed_type: None,
+            follower_last_reset_election_elapsed_time: 0,
+            leader_last_bcast_heartbeat_time: 0,
+            leader_last_bcast_append_time: 0,
+            leader_last_tick_time: 0,
+            fsm_last_tick_time: 0,
+            fsm_missing_ticks: 0,
         };
         confchange::restore(&mut r.prs, r.r.raft_log.last_index(), conf_state)?;
         let new_cs = r.post_conf_change();
@@ -890,6 +921,7 @@ impl<T: Storage> Raft<T> {
         let self_id = self.id;
         let core = &mut self.r;
         let msgs = &mut self.msgs;
+        self.leader_last_bcast_append_time = current_millis();
         self.prs
             .iter_mut()
             .filter(|&(id, _)| *id != self_id)
@@ -906,6 +938,7 @@ impl<T: Storage> Raft<T> {
     /// Sends RPC, without entries to all the peers.
     pub fn bcast_heartbeat(&mut self) {
         let ctx = self.read_only.last_pending_request_ctx();
+        self.leader_last_bcast_heartbeat_time = current_millis();
         self.bcast_heartbeat_with_ctx(ctx)
     }
 
@@ -1052,8 +1085,18 @@ impl<T: Storage> Raft<T> {
         self.raft_log.maybe_persist_snap(index);
     }
 
+    fn recent_tick_times(&self) -> Vec<u64> {
+        let mut ticks = Vec::with_capacity(cmp::min(self.tick_times_idx, self.tick_times.len()));
+        for i in 0..ticks.capacity() {
+            ticks.push(self.tick_times[(self.tick_times_idx-1-i) % self.tick_times.len()]);
+        }
+        ticks
+    }
+
     /// Returns true to indicate that there will probably be some readiness need to be handled.
     pub fn tick(&mut self) -> bool {
+        self.tick_times[self.tick_times_idx%self.tick_times.len()] = current_millis();
+        self.tick_times_idx += 1;
         match self.state {
             StateRole::Follower | StateRole::PreCandidate | StateRole::Candidate => {
                 self.tick_election()
@@ -1081,6 +1124,7 @@ impl<T: Storage> Raft<T> {
     // tick_heartbeat is run by leaders to send a MsgBeat after self.heartbeat_timeout.
     // Returns true to indicate that there will probably be some readiness need to be handled.
     fn tick_heartbeat(&mut self) -> bool {
+        self.leader_last_tick_time = current_millis();
         self.heartbeat_elapsed += 1;
         self.election_elapsed += 1;
 
@@ -1112,6 +1156,7 @@ impl<T: Storage> Raft<T> {
 
     /// Converts this node to a follower.
     pub fn become_follower(&mut self, term: u64, leader_id: u64) {
+        let orig_role = self.state;
         let pending_request_snapshot = self.pending_request_snapshot;
         self.reset(term);
         self.leader_id = leader_id;
@@ -1122,6 +1167,18 @@ impl<T: Storage> Raft<T> {
             "became follower at term {term}",
             term = self.term;
         );
+        if orig_role == StateRole::Leader {
+            info!(
+                self.logger,
+                ">>> leader became follower";
+                "recent_tick_times" => ?self.recent_tick_times(),
+                "fsm_missing_ticks" => self.fsm_missing_ticks,
+                "fsm_last_tick_time" => ?self.fsm_last_tick_time,
+                "last_tick_time" => ?self.leader_last_tick_time,
+                "last_bcast_heatbeat_time" => ?self.leader_last_bcast_heartbeat_time,
+                "last_bcast_append_time" => ?self.leader_last_bcast_append_time,
+            );
+        }
     }
 
     // TODO: revoke pub when there is a better way to test.
@@ -1230,6 +1287,9 @@ impl<T: Storage> Raft<T> {
             "became leader at term {term}",
             term = self.term;
         );
+        self.leader_last_tick_time = 0;
+        self.leader_last_bcast_heartbeat_time = 0;
+        self.leader_last_bcast_append_time = 0;
         trace!(self.logger, "EXIT become_leader");
     }
 
@@ -2313,16 +2373,22 @@ impl<T: Storage> Raft<T> {
                 self.election_elapsed = 0;
                 self.leader_id = m.from;
                 self.handle_append_entries(&m);
+                self.follower_last_reset_election_elapsed_type = Some(MessageType::MsgAppend);
+                self.follower_last_reset_election_elapsed_time = current_millis();
             }
             MessageType::MsgHeartbeat => {
                 self.election_elapsed = 0;
                 self.leader_id = m.from;
                 self.handle_heartbeat(m);
+                self.follower_last_reset_election_elapsed_type = Some(MessageType::MsgHeartbeat);
+                self.follower_last_reset_election_elapsed_time = current_millis();
             }
             MessageType::MsgSnapshot => {
                 self.election_elapsed = 0;
                 self.leader_id = m.from;
                 self.handle_snapshot(m);
+                self.follower_last_reset_election_elapsed_type = Some(MessageType::MsgSnapshot);
+                self.follower_last_reset_election_elapsed_time = current_millis();
             }
             MessageType::MsgTransferLeader => {
                 if self.leader_id == INVALID_ID {
@@ -2778,6 +2844,19 @@ impl<T: Storage> Raft<T> {
     /// than or equal to the randomized election timeout in
     /// [`election_timeout`, 2 * `election_timeout` - 1].
     pub fn pass_election_timeout(&self) -> bool {
+        if  self.randomized_election_timeout - self.election_elapsed < 5 {
+            info!(
+                self.logger,
+                ">>> election almost timeout ({}/{})",
+                self.election_elapsed,
+                self.randomized_election_timeout;
+                "recent_tick_times" => ?self.recent_tick_times(),
+                "last_reset_time" => ?self.follower_last_reset_election_elapsed_time,
+                "last_reset_type" => ?self.follower_last_reset_election_elapsed_type,
+                "role" => ?self.state,
+                "term" => self.term,
+            );
+        }
         self.election_elapsed >= self.randomized_election_timeout
     }
 
